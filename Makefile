@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: test check benchmark
+.PHONY: test check benchmark secrets
 
 test:
 	$(PYTHON) -m unittest discover -s tests
@@ -10,3 +10,6 @@ check:
 
 benchmark:
 	$(PYTHON) scripts/benchmark.py benchmarks/sample_cases.json
+
+secrets:
+	@echo "Secret scanning runs in GitHub Actions via gitleaks."

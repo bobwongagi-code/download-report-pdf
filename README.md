@@ -55,6 +55,7 @@ python3 scripts/download_and_ocr.py "PASTE_LINK_HERE" --paddle-script "/path/to/
 - `tests/`: unit tests for downloader output and benchmark summaries
 - `benchmarks/sample_cases.json`: sample benchmark manifest
 - `.github/workflows/ci.yml`: continuous integration
+- `.github/workflows/secret-scan.yml`: GitHub Actions secret scanning
 
 ## Installation
 
@@ -88,6 +89,8 @@ make test
 make check
 make benchmark
 ```
+
+The repository also runs a separate GitHub Actions secret scan on pushes and pull requests.
 
 ## Example Output
 
@@ -146,6 +149,8 @@ Run the local checks:
 python3 -m unittest discover -s tests
 python3 -m py_compile scripts/download_and_ocr.py scripts/benchmark.py
 ```
+
+Secret scanning is enforced in GitHub Actions with `gitleaks`.
 
 ## Contributing
 
