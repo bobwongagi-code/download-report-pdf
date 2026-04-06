@@ -16,9 +16,10 @@ from email.parser import Parser
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
 
-PADDLE_SCRIPT = Path(
+DEFAULT_PADDLE_SCRIPT = Path(
     "/Users/wangbo5/.agents/skills/paddleocr-doc-parsing/scripts/vl_caller.py"
 )
+PADDLE_SCRIPT_ENV_VAR = "URL_PDF_DOWNLOAD_OCR_PADDLE_SCRIPT"
 DEFAULT_UA = "Mozilla/5.0 (Codex URL PDF OCR)"
 CONNECT_TIMEOUT_SECONDS = 10
 REQUEST_TIMEOUT_SECONDS = 45
@@ -74,6 +75,15 @@ def classify_failure_reason(message: str) -> str:
     ):
         return "network"
     return "unknown"
+
+
+def resolve_paddle_script(configured_path: Optional[str]) -> Path:
+    if configured_path:
+        return Path(os.path.expanduser(configured_path))
+    env_path = os.environ.get(PADDLE_SCRIPT_ENV_VAR)
+    if env_path:
+        return Path(os.path.expanduser(env_path))
+    return DEFAULT_PADDLE_SCRIPT
 
 
 def file_sha256(path: Path) -> str:
@@ -583,9 +593,10 @@ def build_markdown_from_result(result_path: Path, markdown_path: Path) -> None:
     markdown_path.write_text("\n\n".join(chunks).rstrip() + "\n", encoding="utf-8")
 
 
-def run_paddleocr(pdf_path: Path) -> tuple[Path, Optional[str], bool, str]:
-    if not PADDLE_SCRIPT.exists():
-        raise RuntimeError(f"PaddleOCR script not found: {PADDLE_SCRIPT}")
+def run_paddleocr(pdf_path: Path, configured_paddle_script: Optional[str]) -> tuple[Path, Optional[str], bool, str]:
+    paddle_script = resolve_paddle_script(configured_paddle_script)
+    if not paddle_script.exists():
+        raise RuntimeError(f"PaddleOCR script not found: {paddle_script}")
 
     markdown_path = pdf_path.with_suffix(".md")
     pdf_hash = file_sha256(pdf_path)
@@ -601,7 +612,7 @@ def run_paddleocr(pdf_path: Path) -> tuple[Path, Optional[str], bool, str]:
 
     cmd = [
         sys.executable,
-        str(PADDLE_SCRIPT),
+        str(paddle_script),
         "--file-path",
         str(pdf_path),
         "--file-type",
@@ -639,6 +650,14 @@ def main() -> int:
         "--output-dir",
         default=str(Path.home() / "Downloads"),
         help="Directory to store the PDF and Markdown files (default: ~/Downloads)",
+    )
+    parser.add_argument(
+        "--paddle-script",
+        default=None,
+        help=(
+            "Path to the PaddleOCR document parsing script. "
+            f"Defaults to ${PADDLE_SCRIPT_ENV_VAR} or {DEFAULT_PADDLE_SCRIPT}"
+        ),
     )
     args = parser.parse_args()
 
@@ -680,7 +699,7 @@ def main() -> int:
 
     try:
         ocr_started_ms = now_ms()
-        md_path, paddle_note, cache_hit, pdf_hash = run_paddleocr(pdf_path)
+        md_path, paddle_note, cache_hit, pdf_hash = run_paddleocr(pdf_path, args.paddle_script)
         metrics["ocr_ms"] = now_ms() - ocr_started_ms
         metrics["ocr_cache_hit"] = cache_hit
         metrics["pdf_sha256"] = pdf_hash

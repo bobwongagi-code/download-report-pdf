@@ -25,6 +25,12 @@ Optional output directory:
 python3 scripts/download_and_ocr.py "PASTE_LINK_HERE" --output-dir "/custom/path"
 ```
 
+Optional PaddleOCR override:
+
+```bash
+python3 scripts/download_and_ocr.py "PASTE_LINK_HERE" --paddle-script "/path/to/vl_caller.py"
+```
+
 ## Behavior
 
 - Accept direct PDF URLs, redirected download URLs, HubSpot email links, HubSpot tracking links, and HTML pages that expose a PDF link.
@@ -48,6 +54,11 @@ python3 scripts/download_and_ocr.py "PASTE_LINK_HERE" --output-dir "/custom/path
 After download, always invoke the PaddleOCR document parsing script at:
 
 `/Users/wangbo5/.agents/skills/paddleocr-doc-parsing/scripts/vl_caller.py`
+
+To make the repository portable, prefer either:
+
+- `--paddle-script "/path/to/vl_caller.py"`
+- `URL_PDF_DOWNLOAD_OCR_PADDLE_SCRIPT=/path/to/vl_caller.py`
 
 Use local-file mode with `--file-path` and `--file-type 0`.
 

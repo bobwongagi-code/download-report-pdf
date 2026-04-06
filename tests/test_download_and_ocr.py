@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -62,6 +63,19 @@ class DownloadAndOcrTests(unittest.TestCase):
             module.classify_failure_reason("PaddleOCR script not found: /tmp/x"),
             "ocr_configuration",
         )
+
+    def test_resolve_paddle_script_prefers_cli_then_env_then_default(self):
+        module = load_module()
+
+        with mock.patch.dict(os.environ, {"URL_PDF_DOWNLOAD_OCR_PADDLE_SCRIPT": "/tmp/from-env.py"}, clear=False):
+            self.assertEqual(
+                module.resolve_paddle_script("/tmp/from-cli.py"),
+                Path("/tmp/from-cli.py"),
+            )
+            self.assertEqual(
+                module.resolve_paddle_script(None),
+                Path("/tmp/from-env.py"),
+            )
 
 
 if __name__ == "__main__":
