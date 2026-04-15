@@ -107,6 +107,13 @@ Failed runs still emit structured JSON, including:
 - `failure_reason`
 - `download_error` or `ocr_error`
 
+For large PDFs, OCR now uses a resumable chunked workflow:
+
+- chunk size is chosen dynamically from page count and file density
+- chunk outputs are persisted under the local Codex cache
+- rerunning the same PDF resumes unfinished chunks instead of restarting from page 1
+- the final `.md` is only produced after all chunks succeed
+
 ## Benchmarking
 
 The benchmark runner reads a JSON case manifest. Each case can include:
@@ -140,6 +147,18 @@ The summary includes:
 - OCR cache hit rate
 - download efficiency metrics
 - provider rule candidates for follow-up work
+
+## Large PDF Behavior
+
+Large PDFs no longer rely on a single monolithic OCR pass.
+
+- the wrapper computes page count and file size
+- larger documents are split into chunk PDFs
+- each chunk is retried independently on retryable failures
+- job state is stored under `~/.codex/cache/url-pdf-download-ocr/jobs/<pdf-hash>/`
+- rerunning the command resumes from unfinished chunks
+
+This keeps user-visible success strict: no final Markdown file is emitted until every chunk finishes successfully.
 
 ## Verification
 

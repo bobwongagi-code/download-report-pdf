@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from pypdf import PdfWriter
+
 
 SCRIPT_PATH = Path("/Users/wangbo5/.codex/skills/url-pdf-download-ocr/scripts/download_and_ocr.py")
 
@@ -22,6 +24,74 @@ def load_module():
 
 
 class DownloadAndOcrTests(unittest.TestCase):
+    def test_calculate_chunk_size_scales_with_document_density(self):
+        module = load_module()
+
+        self.assertEqual(module.calculate_chunk_size(total_pages=423, file_size_bytes=37 * 1024 * 1024), 20)
+        self.assertEqual(module.calculate_chunk_size(total_pages=200, file_size_bytes=8 * 1024 * 1024), 50)
+        self.assertEqual(module.calculate_chunk_size(total_pages=80, file_size_bytes=2 * 1024 * 1024), 80)
+
+    def test_initialize_job_state_creates_chunk_plan_and_paths(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "sample.pdf"
+            writer = PdfWriter()
+            for _ in range(5):
+                writer.add_blank_page(width=72, height=72)
+            with pdf_path.open("wb") as fh:
+                writer.write(fh)
+
+            job_dir = Path(tmpdir) / "job"
+            state = module.initialize_or_load_job_state(
+                pdf_path=pdf_path,
+                pdf_hash="abc123",
+                total_pages=5,
+                file_size_bytes=pdf_path.stat().st_size,
+                chunk_size=2,
+                job_dir=job_dir,
+            )
+
+            self.assertEqual(state["pdf_hash"], "abc123")
+            self.assertEqual(state["total_pages"], 5)
+            self.assertEqual(len(state["chunks"]), 3)
+            self.assertEqual(state["chunks"][0]["start_page"], 1)
+            self.assertEqual(state["chunks"][0]["end_page"], 2)
+            self.assertEqual(state["chunks"][2]["start_page"], 5)
+            self.assertEqual(state["chunks"][2]["end_page"], 5)
+            self.assertTrue((job_dir / "status.json").exists())
+
+    def test_pending_chunks_skip_completed_entries(self):
+        module = load_module()
+        state = {
+            "chunks": [
+                {"index": 1, "status": "completed"},
+                {"index": 2, "status": "failed"},
+                {"index": 3, "status": "pending"},
+            ]
+        }
+
+        pending = module.get_pending_chunks(state)
+
+        self.assertEqual([chunk["index"] for chunk in pending], [2, 3])
+
+    def test_pending_chunks_requeue_completed_chunk_if_markdown_missing(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            existing_md = Path(tmpdir) / "chunk_001.md"
+            existing_md.write_text("ok\n", encoding="utf-8")
+            missing_md = Path(tmpdir) / "chunk_002.md"
+            state = {
+                "chunks": [
+                    {"index": 1, "status": "completed", "markdown_path": str(existing_md)},
+                    {"index": 2, "status": "completed", "markdown_path": str(missing_md)},
+                ]
+            }
+
+            pending = module.get_pending_chunks(state)
+
+        self.assertEqual([chunk["index"] for chunk in pending], [2])
+
     def test_download_failure_returns_structured_json(self):
         module = load_module()
         stdout = io.StringIO()

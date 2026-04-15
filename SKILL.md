@@ -83,6 +83,8 @@ If PaddleOCR is not configured or returns an error:
 - The downloader uses bounded timeouts and retries.
 - Candidate links are probed before full download to reduce wasted bandwidth.
 - OCR results are cached by PDF content hash under the local Codex cache directory, so repeated runs on the same PDF can reuse the existing Markdown output.
+- Large PDFs are OCRed through a resumable chunked workflow with persisted job state under the local Codex cache.
+- The skill does not treat partial OCR as success; it only emits the final Markdown file after every chunk succeeds.
 
 ## Benchmarking
 
