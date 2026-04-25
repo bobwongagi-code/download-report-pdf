@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT_PATH = Path("/Users/wangbo5/.codex/skills/url-pdf-download-ocr/scripts/benchmark.py")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = REPO_ROOT / "scripts" / "benchmark.py"
 
 
 def load_module():

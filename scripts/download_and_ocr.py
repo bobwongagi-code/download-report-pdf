@@ -384,6 +384,14 @@ def looks_like_pdf(headers: dict[str, str], url: str, data: bytes) -> bool:
     return data.startswith(b"%PDF-")
 
 
+def has_pdf_file_signature(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            return fh.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def extract_filename(headers: dict[str, str], url: str) -> str:
     disposition = headers.get("content-disposition", "")
     match = re.search(r"filename\\*=UTF-8''([^;]+)", disposition, re.I)
@@ -674,12 +682,13 @@ def download_pdf(source_url: str, output_dir: Path) -> tuple[Path, str, dict[str
     pdf_path = ensure_unique_path(output_dir / filename)
     final_download_started_ms = now_ms()
     download_headers, final_pdf_url = stream_download_to_path(pdf_url, pdf_path)
-    if not looks_like_pdf(download_headers, final_pdf_url, b""):
+    if not has_pdf_file_signature(pdf_path):
+        pdf_path.unlink(missing_ok=True)
+        raise RuntimeError("Resolved URL did not produce a valid PDF during final download.")
+    if not looks_like_pdf(download_headers, final_pdf_url, b"%PDF-"):
         head, head_final_url = curl_head(final_pdf_url)
-        if not looks_like_pdf(head, head_final_url, b""):
-            pdf_path.unlink(missing_ok=True)
-            raise RuntimeError("Resolved URL did not produce a valid PDF during final download.")
-        final_pdf_url = head_final_url
+        if looks_like_pdf(head, head_final_url, b"%PDF-"):
+            final_pdf_url = head_final_url
     metrics["final_download_ms"] = now_ms() - final_download_started_ms
     metrics["download_total_ms"] = now_ms() - download_started_ms
     return pdf_path, final_pdf_url, metrics

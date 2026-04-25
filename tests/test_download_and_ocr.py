@@ -12,7 +12,8 @@ from unittest import mock
 from pypdf import PdfWriter
 
 
-SCRIPT_PATH = Path("/Users/wangbo5/.codex/skills/url-pdf-download-ocr/scripts/download_and_ocr.py")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = REPO_ROOT / "scripts" / "download_and_ocr.py"
 
 
 def load_module():
@@ -117,6 +118,38 @@ class DownloadAndOcrTests(unittest.TestCase):
         self.assertEqual(payload["metrics"]["failure_stage"], "download")
         self.assertEqual(payload["metrics"]["failure_reason"], "network")
         self.assertEqual(payload["metrics"]["source_url"], "https://example.com/report")
+
+    def test_download_pdf_rejects_saved_html_from_pdf_url(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+
+            def fake_stream_download(url, destination):
+                destination.write_text("<html>login required</html>\n", encoding="utf-8")
+                return {"content-type": "application/pdf"}, url
+
+            with mock.patch.object(
+                module,
+                "probe_url",
+                return_value=module.ProbeResult(
+                    url="https://example.com/report.pdf",
+                    final_url="https://example.com/report.pdf",
+                    headers={"content-type": "application/pdf"},
+                    body=b"",
+                    is_pdf=True,
+                    is_html=False,
+                ),
+            ):
+                with mock.patch.object(
+                    module,
+                    "stream_download_to_path",
+                    side_effect=fake_stream_download,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "valid PDF"):
+                        module.download_pdf("https://example.com/report.pdf", output_dir)
+
+            self.assertFalse((output_dir / "report.pdf").exists())
 
     def test_classify_failure_reason_maps_common_errors(self):
         module = load_module()
