@@ -53,7 +53,7 @@ python3 scripts/download_and_ocr.py "PASTE_LINK_HERE" --paddle-script "/path/to/
 
 After download, always invoke the PaddleOCR document parsing script at:
 
-`/Users/wangbo5/.agents/skills/paddleocr-doc-parsing/scripts/vl_caller.py`
+`~/.agents/skills/paddleocr-doc-parsing/scripts/vl_caller.py`
 
 To make the repository portable, prefer either:
 

@@ -1,5 +1,4 @@
 import contextlib
-import importlib.util
 import io
 import json
 import os
@@ -12,29 +11,23 @@ from unittest import mock
 from pypdf import PdfWriter
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "download_and_ocr.py"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
-
-def load_module():
-    spec = importlib.util.spec_from_file_location("url_pdf_download_ocr", SCRIPT_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+import download_and_ocr as main_mod
+import http_download
+import ocr_runner
+import providers
 
 
 class DownloadAndOcrTests(unittest.TestCase):
     def test_calculate_chunk_size_scales_with_document_density(self):
-        module = load_module()
-
-        self.assertEqual(module.calculate_chunk_size(total_pages=423, file_size_bytes=37 * 1024 * 1024), 20)
-        self.assertEqual(module.calculate_chunk_size(total_pages=200, file_size_bytes=8 * 1024 * 1024), 50)
-        self.assertEqual(module.calculate_chunk_size(total_pages=80, file_size_bytes=2 * 1024 * 1024), 80)
+        self.assertEqual(ocr_runner.calculate_chunk_size(total_pages=423, file_size_bytes=37 * 1024 * 1024), 20)
+        self.assertEqual(ocr_runner.calculate_chunk_size(total_pages=200, file_size_bytes=8 * 1024 * 1024), 50)
+        self.assertEqual(ocr_runner.calculate_chunk_size(total_pages=80, file_size_bytes=2 * 1024 * 1024), 80)
 
     def test_initialize_job_state_creates_chunk_plan_and_paths(self):
-        module = load_module()
-
         with tempfile.TemporaryDirectory() as tmpdir:
             pdf_path = Path(tmpdir) / "sample.pdf"
             writer = PdfWriter()
@@ -44,7 +37,7 @@ class DownloadAndOcrTests(unittest.TestCase):
                 writer.write(fh)
 
             job_dir = Path(tmpdir) / "job"
-            state = module.initialize_or_load_job_state(
+            state = ocr_runner.initialize_or_load_job_state(
                 pdf_path=pdf_path,
                 pdf_hash="abc123",
                 total_pages=5,
@@ -63,7 +56,6 @@ class DownloadAndOcrTests(unittest.TestCase):
             self.assertTrue((job_dir / "status.json").exists())
 
     def test_pending_chunks_skip_completed_entries(self):
-        module = load_module()
         state = {
             "chunks": [
                 {"index": 1, "status": "completed"},
@@ -72,12 +64,11 @@ class DownloadAndOcrTests(unittest.TestCase):
             ]
         }
 
-        pending = module.get_pending_chunks(state)
+        pending = ocr_runner.get_pending_chunks(state)
 
         self.assertEqual([chunk["index"] for chunk in pending], [2, 3])
 
     def test_pending_chunks_requeue_completed_chunk_if_markdown_missing(self):
-        module = load_module()
         with tempfile.TemporaryDirectory() as tmpdir:
             existing_md = Path(tmpdir) / "chunk_001.md"
             existing_md.write_text("ok\n", encoding="utf-8")
@@ -89,26 +80,26 @@ class DownloadAndOcrTests(unittest.TestCase):
                 ]
             }
 
-            pending = module.get_pending_chunks(state)
+            pending = ocr_runner.get_pending_chunks(state)
 
         self.assertEqual([chunk["index"] for chunk in pending], [2])
 
     def test_download_failure_returns_structured_json(self):
-        module = load_module()
         stdout = io.StringIO()
         stderr = io.StringIO()
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = SCRIPTS_DIR / "download_and_ocr.py"
             argv = [
-                str(SCRIPT_PATH),
+                str(script_path),
                 "https://example.com/report",
                 "--output-dir",
                 tmpdir,
             ]
             with mock.patch.object(sys, "argv", argv):
-                with mock.patch.object(module, "download_pdf", side_effect=RuntimeError("network boom")):
+                with mock.patch.object(main_mod, "download_pdf", side_effect=RuntimeError("network boom")):
                     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                        exit_code = module.main()
+                        exit_code = main_mod.main()
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stderr.getvalue(), "")
@@ -120,8 +111,6 @@ class DownloadAndOcrTests(unittest.TestCase):
         self.assertEqual(payload["metrics"]["source_url"], "https://example.com/report")
 
     def test_download_pdf_rejects_saved_html_from_pdf_url(self):
-        module = load_module()
-
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
 
@@ -130,9 +119,9 @@ class DownloadAndOcrTests(unittest.TestCase):
                 return {"content-type": "application/pdf"}, url
 
             with mock.patch.object(
-                module,
+                main_mod,
                 "probe_url",
-                return_value=module.ProbeResult(
+                return_value=http_download.ProbeResult(
                     url="https://example.com/report.pdf",
                     final_url="https://example.com/report.pdf",
                     headers={"content-type": "application/pdf"},
@@ -142,41 +131,37 @@ class DownloadAndOcrTests(unittest.TestCase):
                 ),
             ):
                 with mock.patch.object(
-                    module,
+                    main_mod,
                     "stream_download_to_path",
                     side_effect=fake_stream_download,
                 ):
                     with self.assertRaisesRegex(RuntimeError, "valid PDF"):
-                        module.download_pdf("https://example.com/report.pdf", output_dir)
+                        main_mod.download_pdf("https://example.com/report.pdf", output_dir)
 
             self.assertFalse((output_dir / "report.pdf").exists())
 
     def test_classify_failure_reason_maps_common_errors(self):
-        module = load_module()
-
         self.assertEqual(
-            module.classify_failure_reason("The page may require login, an extraction code, or interactive JavaScript."),
+            ocr_runner.classify_failure_reason("The page may require login, an extraction code, or interactive JavaScript."),
             "authentication_or_interactive",
         )
         self.assertEqual(
-            module.classify_failure_reason("curl timed out after 45s"),
+            ocr_runner.classify_failure_reason("curl timed out after 45s"),
             "timeout",
         )
         self.assertEqual(
-            module.classify_failure_reason("PaddleOCR script not found: /tmp/x"),
+            ocr_runner.classify_failure_reason("PaddleOCR script not found: /tmp/x"),
             "ocr_configuration",
         )
 
     def test_resolve_paddle_script_prefers_cli_then_env_then_default(self):
-        module = load_module()
-
         with mock.patch.dict(os.environ, {"URL_PDF_DOWNLOAD_OCR_PADDLE_SCRIPT": "/tmp/from-env.py"}, clear=False):
             self.assertEqual(
-                module.resolve_paddle_script("/tmp/from-cli.py"),
+                ocr_runner.resolve_paddle_script("/tmp/from-cli.py"),
                 Path("/tmp/from-cli.py"),
             )
             self.assertEqual(
-                module.resolve_paddle_script(None),
+                ocr_runner.resolve_paddle_script(None),
                 Path("/tmp/from-env.py"),
             )
 

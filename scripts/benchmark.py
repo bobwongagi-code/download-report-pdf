@@ -6,14 +6,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 DOWNLOAD_SCRIPT = SKILL_ROOT / "scripts" / "download_and_ocr.py"
 
 
-def percentile_nearest_rank(values: list[int], percent: int) -> int | None:
+def percentile_nearest_rank(values: list[int], percent: int) -> Optional[int]:
     if not values:
         return None
     ordered = sorted(values)
@@ -21,13 +21,13 @@ def percentile_nearest_rank(values: list[int], percent: int) -> int | None:
     return ordered[rank - 1]
 
 
-def average(values: list[int]) -> float | None:
+def average(values: list[int]) -> Optional[float]:
     if not values:
         return None
     return round(sum(values) / len(values), 4)
 
 
-def normalize_expected_outcome(value: str | None) -> str | None:
+def normalize_expected_outcome(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     normalized = value.strip().lower().replace("-", "_")
@@ -176,74 +176,164 @@ def build_provider_rule_candidates(by_provider: dict[str, dict[str, Any]]) -> li
     return candidates
 
 
+def _collect_metric_int_list(results: list[dict[str, Any]], key: str) -> list[int]:
+    """Extract a list of int metric values for *key*, skipping items without the metric."""
+    return [
+        int(item["metrics"][key])
+        for item in results
+        if isinstance(item.get("metrics"), dict) and item["metrics"].get(key) is not None
+    ]
+
+
+def _count_string_field(results: list[dict[str, Any]], field_path: str) -> dict[str, int]:
+    """Count occurrences of a string-valued metric across all results."""
+    counts: dict[str, int] = {}
+    for item in results:
+        value = item.get("metrics", {}).get(field_path)
+        if value is not None:
+            key = str(value)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _count_regression_reasons(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in results:
+        for reason in item.get("regression_reasons", []):
+            key = str(reason)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _extract_item_facts(item: dict[str, Any]) -> dict[str, Any]:
+    """Derive common booleans and metric values from a single result item."""
+    metrics = item.get("metrics", {})
+    return {
+        "pdf_created": bool(item.get("pdf_created")),
+        "md_created": bool(item.get("md_created")),
+        "download_failed": (
+            item.get("status") == "download_failed"
+            or metrics.get("failure_stage") == "download"
+        ),
+        "ocr_failed": (
+            item.get("status") == "ocr_failed"
+            or metrics.get("failure_stage") == "ocr"
+        ),
+        "crashed": item.get("status") == "crash",
+        "is_regression": bool(item.get("is_regression")),
+        "cache_eligible": metrics.get("ocr_cache_hit") is not None,
+        "cache_hit": bool(metrics.get("ocr_cache_hit")),
+        "candidate_count": metrics.get("candidate_count"),
+        "candidate_probe_count": metrics.get("candidate_probe_count"),
+        "resolved_via": metrics.get("resolved_via"),
+        "failure_reason": metrics.get("failure_reason"),
+        "regression_reasons": item.get("regression_reasons", []),
+    }
+
+
+def _new_bucket(include_provider_fields: bool = False) -> dict[str, Any]:
+    """Create a fresh accumulation bucket for by_input_type or by_provider."""
+    bucket: dict[str, Any] = {
+        "count": 0,
+        "pdf_success_count": 0,
+        "full_success_count": 0,
+        "download_failure_count": 0,
+        "ocr_failure_count": 0,
+        "crash_count": 0,
+        "regression_count": 0,
+        "regression_reason_counts": {},
+        "candidate_count_total": 0,
+        "candidate_count_cases": 0,
+        "candidate_probe_count_total": 0,
+        "candidate_probe_count_cases": 0,
+        "failure_reason_counts": {},
+    }
+    if include_provider_fields:
+        bucket.update({
+            "ocr_cache_hit_count": 0,
+            "ocr_cache_eligible_count": 0,
+            "resolved_via_counts": {},
+        })
+    return bucket
+
+
+def _accumulate_item(bucket: dict[str, Any], facts: dict[str, Any]) -> None:
+    """Add one result item's facts into *bucket* (mutates in place)."""
+    bucket["count"] += 1
+    bucket["pdf_success_count"] += int(facts["pdf_created"])
+    bucket["full_success_count"] += int(facts["pdf_created"] and facts["md_created"])
+    bucket["download_failure_count"] += int(facts["download_failed"])
+    bucket["ocr_failure_count"] += int(facts["ocr_failed"])
+    bucket["crash_count"] += int(facts["crashed"])
+    bucket["regression_count"] += int(facts["is_regression"])
+
+    if facts["candidate_count"] is not None:
+        bucket["candidate_count_total"] += int(facts["candidate_count"])
+        bucket["candidate_count_cases"] += 1
+    if facts["candidate_probe_count"] is not None:
+        bucket["candidate_probe_count_total"] += int(facts["candidate_probe_count"])
+        bucket["candidate_probe_count_cases"] += 1
+
+    failure_reason = facts["failure_reason"]
+    if failure_reason is not None:
+        key = str(failure_reason)
+        bucket["failure_reason_counts"][key] = bucket["failure_reason_counts"].get(key, 0) + 1
+    for reason in facts["regression_reasons"]:
+        key = str(reason)
+        bucket["regression_reason_counts"][key] = bucket["regression_reason_counts"].get(key, 0) + 1
+
+    # Provider-only fields (no-op when absent from bucket).
+    if "ocr_cache_hit_count" in bucket:
+        bucket["ocr_cache_hit_count"] += int(facts["cache_hit"])
+        bucket["ocr_cache_eligible_count"] += int(facts["cache_eligible"])
+    if "resolved_via_counts" in bucket and facts["resolved_via"] is not None:
+        key = str(facts["resolved_via"])
+        bucket["resolved_via_counts"][key] = bucket["resolved_via_counts"].get(key, 0) + 1
+
+
+def _finalize_candidate_averages(bucket: dict[str, Any]) -> None:
+    """Replace raw totals/cases with computed averages (mutates in place)."""
+    cc_cases = bucket.pop("candidate_count_cases")
+    cpc_cases = bucket.pop("candidate_probe_count_cases")
+    cc_total = bucket.pop("candidate_count_total")
+    cpc_total = bucket.pop("candidate_probe_count_total")
+    bucket["avg_candidate_count"] = round(cc_total / cc_cases, 4) if cc_cases else None
+    bucket["avg_candidate_probe_count"] = round(cpc_total / cpc_cases, 4) if cpc_cases else None
+
+    if "ocr_cache_eligible_count" in bucket:
+        eligible = bucket["ocr_cache_eligible_count"]
+        bucket["ocr_cache_hit_rate"] = (
+            round(bucket["ocr_cache_hit_count"] / eligible, 4) if eligible else None
+        )
+
+
 def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
-    total_ms_values = [
-        int(item["metrics"]["total_ms"])
-        for item in results
-        if isinstance(item.get("metrics"), dict) and item["metrics"].get("total_ms") is not None
-    ]
-    candidate_counts = [
-        int(item["metrics"]["candidate_count"])
-        for item in results
-        if isinstance(item.get("metrics"), dict) and item["metrics"].get("candidate_count") is not None
-    ]
-    candidate_probe_counts = [
-        int(item["metrics"]["candidate_probe_count"])
-        for item in results
-        if isinstance(item.get("metrics"), dict)
-        and item["metrics"].get("candidate_probe_count") is not None
-    ]
-    download_total_ms_values = [
-        int(item["metrics"]["download_total_ms"])
-        for item in results
-        if isinstance(item.get("metrics"), dict) and item["metrics"].get("download_total_ms") is not None
-    ]
-    final_download_ms_values = [
-        int(item["metrics"]["final_download_ms"])
-        for item in results
-        if isinstance(item.get("metrics"), dict) and item["metrics"].get("final_download_ms") is not None
-    ]
+    total_ms_values = _collect_metric_int_list(results, "total_ms")
+    candidate_counts = _collect_metric_int_list(results, "candidate_count")
+    candidate_probe_counts = _collect_metric_int_list(results, "candidate_probe_count")
+    download_total_ms_values = _collect_metric_int_list(results, "download_total_ms")
+    final_download_ms_values = _collect_metric_int_list(results, "final_download_ms")
+
     ocr_cache_eligible_count = sum(
         1 for item in results if item.get("metrics", {}).get("ocr_cache_hit") is not None
     )
     ocr_cache_hit_count = sum(
         1 for item in results if bool(item.get("metrics", {}).get("ocr_cache_hit"))
     )
-    resolved_via_counts: dict[str, int] = {}
-    failure_reason_counts: dict[str, int] = {}
-    regression_reason_counts: dict[str, int] = {}
-    for item in results:
-        resolved_via = item.get("metrics", {}).get("resolved_via")
-        if resolved_via is not None:
-            resolved_via_counts[str(resolved_via)] = resolved_via_counts.get(str(resolved_via), 0) + 1
-        failure_reason = item.get("metrics", {}).get("failure_reason")
-        if failure_reason is not None:
-            failure_reason_counts[str(failure_reason)] = (
-                failure_reason_counts.get(str(failure_reason), 0) + 1
-            )
-        for reason in item.get("regression_reasons", []):
-            regression_reason_counts[str(reason)] = regression_reason_counts.get(str(reason), 0) + 1
+    resolved_via_counts = _count_string_field(results, "resolved_via")
+    failure_reason_counts = _count_string_field(results, "failure_reason")
+    regression_reason_counts = _count_regression_reasons(results)
+
+    all_facts = [_extract_item_facts(item) for item in results]
 
     summary: dict[str, Any] = {
         "total_cases": len(results),
-        "pdf_success_count": sum(1 for item in results if item.get("pdf_created")),
-        "full_success_count": sum(
-            1 for item in results if item.get("pdf_created") and item.get("md_created")
-        ),
-        "download_failure_count": sum(
-            1
-            for item in results
-            if item.get("status") == "download_failed"
-            or item.get("metrics", {}).get("failure_stage") == "download"
-        ),
-        "ocr_failure_count": sum(
-            1
-            for item in results
-            if item.get("status") == "ocr_failed"
-            or item.get("metrics", {}).get("failure_stage") == "ocr"
-        ),
-        "crash_count": sum(1 for item in results if item.get("status") == "crash"),
-        "regression_count": sum(1 for item in results if bool(item.get("is_regression"))),
+        "pdf_success_count": sum(1 for f in all_facts if f["pdf_created"]),
+        "full_success_count": sum(1 for f in all_facts if f["pdf_created"] and f["md_created"]),
+        "download_failure_count": sum(1 for f in all_facts if f["download_failed"]),
+        "ocr_failure_count": sum(1 for f in all_facts if f["ocr_failed"]),
+        "crash_count": sum(1 for f in all_facts if f["crashed"]),
+        "regression_count": sum(1 for f in all_facts if f["is_regression"]),
         "regression_reason_counts": regression_reason_counts,
         "ocr_cache_hit_count": ocr_cache_hit_count,
         "ocr_cache_eligible_count": ocr_cache_eligible_count,
@@ -272,151 +362,22 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "by_provider": {},
     }
 
-    for item in results:
+    for item, facts in zip(results, all_facts):
         input_type = item.get("input_type") or "unknown"
         provider = item.get("metrics", {}).get("provider") or "unknown"
-        pdf_created = bool(item.get("pdf_created"))
-        md_created = bool(item.get("md_created"))
-        download_failed = bool(
-            item.get("status") == "download_failed"
-            or item.get("metrics", {}).get("failure_stage") == "download"
-        )
-        ocr_failed = bool(
-            item.get("status") == "ocr_failed"
-            or item.get("metrics", {}).get("failure_stage") == "ocr"
-        )
-        crashed = bool(item.get("status") == "crash")
-        cache_eligible = item.get("metrics", {}).get("ocr_cache_hit") is not None
-        cache_hit = bool(item.get("metrics", {}).get("ocr_cache_hit"))
-        candidate_count = item.get("metrics", {}).get("candidate_count")
-        candidate_probe_count = item.get("metrics", {}).get("candidate_probe_count")
-        resolved_via = item.get("metrics", {}).get("resolved_via")
-        failure_reason = item.get("metrics", {}).get("failure_reason")
 
-        bucket = summary["by_input_type"].setdefault(
-            input_type,
-            {
-                "count": 0,
-                "pdf_success_count": 0,
-                "full_success_count": 0,
-                "download_failure_count": 0,
-                "ocr_failure_count": 0,
-                "crash_count": 0,
-                "regression_count": 0,
-                "regression_reason_counts": {},
-                "candidate_count_total": 0,
-                "candidate_count_cases": 0,
-                "candidate_probe_count_total": 0,
-                "candidate_probe_count_cases": 0,
-                "failure_reason_counts": {},
-            },
-        )
-        bucket["count"] += 1
-        bucket["pdf_success_count"] += int(pdf_created)
-        bucket["full_success_count"] += int(pdf_created and md_created)
-        bucket["download_failure_count"] += int(download_failed)
-        bucket["ocr_failure_count"] += int(ocr_failed)
-        bucket["crash_count"] += int(crashed)
-        bucket["regression_count"] += int(bool(item.get("is_regression")))
-        if candidate_count is not None:
-            bucket["candidate_count_total"] += int(candidate_count)
-            bucket["candidate_count_cases"] += 1
-        if candidate_probe_count is not None:
-            bucket["candidate_probe_count_total"] += int(candidate_probe_count)
-            bucket["candidate_probe_count_cases"] += 1
-        if failure_reason is not None:
-            bucket["failure_reason_counts"][str(failure_reason)] = (
-                bucket["failure_reason_counts"].get(str(failure_reason), 0) + 1
-            )
-        for reason in item.get("regression_reasons", []):
-            bucket["regression_reason_counts"][str(reason)] = (
-                bucket["regression_reason_counts"].get(str(reason), 0) + 1
-            )
+        bucket = summary["by_input_type"].setdefault(input_type, _new_bucket())
+        _accumulate_item(bucket, facts)
 
         provider_bucket = summary["by_provider"].setdefault(
-            provider,
-            {
-                "count": 0,
-                "pdf_success_count": 0,
-                "full_success_count": 0,
-                "download_failure_count": 0,
-                "ocr_failure_count": 0,
-                "crash_count": 0,
-                "regression_count": 0,
-                "regression_reason_counts": {},
-                "ocr_cache_hit_count": 0,
-                "ocr_cache_eligible_count": 0,
-                "candidate_count_total": 0,
-                "candidate_count_cases": 0,
-                "candidate_probe_count_total": 0,
-                "candidate_probe_count_cases": 0,
-                "resolved_via_counts": {},
-                "failure_reason_counts": {},
-            },
+            provider, _new_bucket(include_provider_fields=True)
         )
-        provider_bucket["count"] += 1
-        provider_bucket["pdf_success_count"] += int(pdf_created)
-        provider_bucket["full_success_count"] += int(pdf_created and md_created)
-        provider_bucket["download_failure_count"] += int(download_failed)
-        provider_bucket["ocr_failure_count"] += int(ocr_failed)
-        provider_bucket["crash_count"] += int(crashed)
-        provider_bucket["regression_count"] += int(bool(item.get("is_regression")))
-        provider_bucket["ocr_cache_hit_count"] += int(cache_hit)
-        provider_bucket["ocr_cache_eligible_count"] += int(cache_eligible)
-        if candidate_count is not None:
-            provider_bucket["candidate_count_total"] += int(candidate_count)
-            provider_bucket["candidate_count_cases"] += 1
-        if candidate_probe_count is not None:
-            provider_bucket["candidate_probe_count_total"] += int(candidate_probe_count)
-            provider_bucket["candidate_probe_count_cases"] += 1
-        if resolved_via is not None:
-            provider_bucket["resolved_via_counts"][str(resolved_via)] = (
-                provider_bucket["resolved_via_counts"].get(str(resolved_via), 0) + 1
-            )
-        if failure_reason is not None:
-            provider_bucket["failure_reason_counts"][str(failure_reason)] = (
-                provider_bucket["failure_reason_counts"].get(str(failure_reason), 0) + 1
-            )
-        for reason in item.get("regression_reasons", []):
-            provider_bucket["regression_reason_counts"][str(reason)] = (
-                provider_bucket["regression_reason_counts"].get(str(reason), 0) + 1
-            )
+        _accumulate_item(provider_bucket, facts)
 
     for bucket in summary["by_input_type"].values():
-        candidate_count_cases = bucket.pop("candidate_count_cases")
-        candidate_probe_count_cases = bucket.pop("candidate_probe_count_cases")
-        candidate_count_total = bucket.pop("candidate_count_total")
-        candidate_probe_count_total = bucket.pop("candidate_probe_count_total")
-        bucket["avg_candidate_count"] = (
-            round(candidate_count_total / candidate_count_cases, 4)
-            if candidate_count_cases
-            else None
-        )
-        bucket["avg_candidate_probe_count"] = (
-            round(candidate_probe_count_total / candidate_probe_count_cases, 4)
-            if candidate_probe_count_cases
-            else None
-        )
-
-    for provider_bucket in summary["by_provider"].values():
-        eligible = provider_bucket["ocr_cache_eligible_count"]
-        provider_bucket["ocr_cache_hit_rate"] = (
-            round(provider_bucket["ocr_cache_hit_count"] / eligible, 4) if eligible else None
-        )
-        candidate_count_cases = provider_bucket.pop("candidate_count_cases")
-        candidate_probe_count_cases = provider_bucket.pop("candidate_probe_count_cases")
-        candidate_count_total = provider_bucket.pop("candidate_count_total")
-        candidate_probe_count_total = provider_bucket.pop("candidate_probe_count_total")
-        provider_bucket["avg_candidate_count"] = (
-            round(candidate_count_total / candidate_count_cases, 4)
-            if candidate_count_cases
-            else None
-        )
-        provider_bucket["avg_candidate_probe_count"] = (
-            round(candidate_probe_count_total / candidate_probe_count_cases, 4)
-            if candidate_probe_count_cases
-            else None
-        )
+        _finalize_candidate_averages(bucket)
+    for bucket in summary["by_provider"].values():
+        _finalize_candidate_averages(bucket)
 
     summary["provider_rule_candidates"] = build_provider_rule_candidates(summary["by_provider"])
 
