@@ -1,7 +1,7 @@
 interface:
-  display_name: "URL PDF OCR"
+  display_name: "URL PDF Download OCR"
   short_description: "Download URL PDFs and OCR to MD."
-  default_prompt: "Use $url-pdf-download-ocr to download a PDF from a URL into Downloads and create a same-name Markdown OCR copy."
+  default_prompt: "Use $url-pdf-download-ocr to download a PDF from a URL into Downloads and create a validated Markdown OCR copy."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

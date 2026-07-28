@@ -29,7 +29,7 @@ Equivalent direct commands:
 
 ```bash
 python3 -m unittest discover -s tests
-python3 -m py_compile scripts/download_and_ocr.py scripts/benchmark.py
+python3 -m py_compile scripts/*.py
 python3 scripts/benchmark.py benchmarks/sample_cases.json
 ```
 

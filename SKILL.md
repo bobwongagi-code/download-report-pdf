@@ -1,6 +1,6 @@
 ---
 name: url-pdf-download-ocr
-description: Download PDFs from user-provided URLs into the default Downloads folder, then create a same-name Markdown OCR copy beside the PDF. Use when a user gives a URL that may be a direct PDF link, a HubSpot email or tracking link, a redirected download link, a Google Drive or Dropbox share link, a SharePoint or OneDrive file link, a Chinese cloud-drive share link, or a webpage that exposes a PDF download. Natural-language triggers include short requests like “下载pdf”, “下载这个pdf”, “把这个链接下载成pdf”, “把这个链接转成md”, or “download this URL as PDF”, as long as a URL or obvious download-link context is present.
+description: Download PDFs from user-provided URLs into the default Downloads folder, then create a validated Markdown OCR copy beside the PDF. Explicit invocation is required for untrusted or unattended URL processing. Use when a user gives a URL that may be a direct PDF link, a HubSpot email or tracking link, a redirected download link, a Google Drive or Dropbox share link, a SharePoint or OneDrive file link, a Chinese cloud-drive share link, or a webpage that exposes a PDF download.
 ---
 
 # URL PDF Download OCR
@@ -11,13 +11,19 @@ Use this skill when the user gives a URL and wants a local PDF plus a Markdown v
 
 1. Save outputs to `~/Downloads` by default unless the user explicitly requests another folder.
 2. Run `scripts/download_and_ocr.py` with the provided link.
-3. Return both output paths: the saved PDF and the generated Markdown file.
+3. Return both output paths only after the PDF and complete Markdown artifacts have been published.
 
 ## Command
 
 ```bash
 python3 scripts/download_and_ocr.py "PASTE_LINK_HERE"
 ```
+
+HTTPS is required by default. Use `--allow-http` only when the public HTTP origin is known
+and plaintext transport is intentional.
+
+Use `--force` only when replacing an existing regular output pair is intentional. Use
+`--no-cache`, `--keep-raw`, or `--purge-cache` only when that behavior is explicitly requested.
 
 Optional output directory:
 
@@ -40,9 +46,11 @@ python3 scripts/download_and_ocr.py "PASTE_LINK_HERE" --paddle-script "/path/to/
 - If the response is HTML instead of PDF, extract likely PDF candidates from the page and retry.
 - Handle HubSpot tracking pages by resolving the second-hop tracking URL before downloading the real PDF.
 - Preserve the server-provided filename when available; otherwise derive a stable name from the final URL.
-- Create a same-name Markdown file beside the PDF, for example:
+- Create a collision-safe Markdown file beside the PDF, for example:
   - `~/Downloads/report.pdf`
-  - `~/Downloads/report.md`
+  - `~/Downloads/report.ocr.md`
+- Existing PDF, Markdown, symlink, and legacy same-stem Markdown paths are never overwritten by default.
+- The downloader rejects private/loopback/link-local/reserved destinations, userinfo URLs, plaintext HTTP by default, and cross-origin page candidates.
 
 ## Limits
 
@@ -51,7 +59,7 @@ python3 scripts/download_and_ocr.py "PASTE_LINK_HERE" --paddle-script "/path/to/
 
 ## PaddleOCR Requirement
 
-After download, always invoke the PaddleOCR document parsing script at:
+After download, ensure OCR through a validated cache entry or the PaddleOCR document parsing script at:
 
 `~/.agents/skills/paddleocr-doc-parsing/scripts/vl_caller.py`
 
@@ -62,7 +70,7 @@ To make the repository portable, prefer either:
 
 Use local-file mode with `--file-path` and `--file-type 0`.
 
-If PaddleOCR is not configured or returns an error:
+When a validated cache entry is available, the PaddleOCR executable does not need to remain installed. If no cache entry is available and PaddleOCR is not configured or returns an error:
 
 - Show the exact error.
 - Do not pretend the Markdown conversion succeeded.
@@ -74,17 +82,18 @@ If PaddleOCR is not configured or returns an error:
 - Report the absolute Markdown path.
 - Include the structured `metrics` block from the script output when debugging, benchmarking, or reviewing performance.
 - Download failures and OCR failures both return structured JSON, so downstream tooling can parse `failure_stage` consistently.
-- Failed runs also include `failure_reason`, using coarse categories such as `network`, `timeout`, `authentication_or_interactive`, `invalid_pdf`, `ocr_configuration`, and `ocr_empty_output`.
+- Failed runs also include `failure_reason`, using coarse categories such as `network`, `network_policy`, `invalid_url`, `timeout`, `authentication_or_interactive`, `invalid_pdf`, `ocr_configuration`, and `ocr_empty_output`.
 - If OCR succeeds, mention that both files were created.
 - If download succeeds but OCR fails, say that only the PDF was created and include the OCR error.
 
 ## Performance Notes
 
 - The downloader uses bounded timeouts and retries.
-- Candidate links are probed before full download to reduce wasted bandwidth.
-- OCR results are cached by PDF content hash under the local Codex cache directory, so repeated runs on the same PDF can reuse the existing Markdown output.
+- Each URL hop is fetched once into bounded staging storage while its response type is determined.
+- OCR results are cached by PDF content and OCR identity under the local Codex cache directory, so repeated runs with the same inputs can reuse the existing Markdown output.
 - Large PDFs are OCRed through a resumable chunked workflow with persisted job state under the local Codex cache.
-- The skill does not treat partial OCR as success; it only emits the final Markdown file after every chunk succeeds.
+- The skill does not treat partial OCR as success; it only emits the final Markdown file after every expected page has explicit validated output.
+- Cache hits are accepted only when the page manifest, schema, expiry, PDF digest, Markdown digest, and OCR script identity match.
 
 ## Benchmarking
 

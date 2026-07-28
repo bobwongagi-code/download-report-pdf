@@ -1,16 +1,34 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import math
 import os
+import platform
+import re
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from pypdf import PdfReader
+from process_supervisor import kill_process_tree, read_capture, run_captured_process
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = SKILL_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from url_utils import normalize_url, redact_text, redact_url
+from version import TOOL_NAME, TOOL_VERSION
+
+
 DOWNLOAD_SCRIPT = SKILL_ROOT / "scripts" / "download_and_ocr.py"
+VALID_EXPECTED_OUTCOMES = {"success", "download_failed", "ocr_failed", "crash"}
+CASE_TIMEOUT_SECONDS = 900
+MAX_CAPTURE_BYTES = 16 * 1024
 
 
 def percentile_nearest_rank(values: list[int], percent: int) -> Optional[int]:
@@ -30,6 +48,8 @@ def average(values: list[int]) -> Optional[float]:
 def normalize_expected_outcome(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
+    if not isinstance(value, str):
+        raise ValueError(f"Unsupported expected_outcome: {value!r}")
     normalized = value.strip().lower().replace("-", "_")
     aliases = {
         "ok": "success",
@@ -40,7 +60,10 @@ def normalize_expected_outcome(value: Optional[str]) -> Optional[str]:
         "pdf_only": "ocr_failed",
         "crash": "crash",
     }
-    return aliases.get(normalized, normalized)
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in VALID_EXPECTED_OUTCOMES:
+        raise ValueError(f"Unsupported expected_outcome: {value!r}")
+    return normalized
 
 
 def outcome_for_result(result: dict[str, Any]) -> str:
@@ -56,7 +79,8 @@ def evaluate_case_expectations(case: dict[str, Any], result: dict[str, Any]) -> 
     expected_provider = case.get("expected_provider")
     expected_outcome = normalize_expected_outcome(case.get("expected_outcome"))
     notes = case.get("notes")
-    actual_provider = result.get("metrics", {}).get("provider")
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    actual_provider = metrics.get("resolved_provider") or metrics.get("provider")
     actual_outcome = outcome_for_result(result)
     regression_reasons: list[str] = []
 
@@ -68,7 +92,7 @@ def evaluate_case_expectations(case: dict[str, Any], result: dict[str, Any]) -> 
     enriched = dict(result)
     enriched["expected_provider"] = expected_provider
     enriched["expected_outcome"] = expected_outcome
-    enriched["notes"] = notes
+    enriched["notes"] = redact_text(str(notes)) if notes is not None else None
     enriched["actual_provider"] = actual_provider
     enriched["actual_outcome"] = actual_outcome
     enriched["is_regression"] = bool(regression_reasons)
@@ -80,6 +104,8 @@ def reason_priority_weight(reason: str) -> int:
     weights = {
         "no_pdf_found": 5,
         "invalid_pdf": 4,
+        "network_policy": 4,
+        "invalid_url": 4,
         "timeout": 3,
         "network": 2,
         "unknown": 2,
@@ -107,6 +133,14 @@ def recommendation_for_reason(reason: str) -> tuple[str, str]:
         "network": (
             "medium",
             "Review provider-specific redirect handling, retry behavior, and network compatibility.",
+        ),
+        "network_policy": (
+            "low",
+            "Check the case URL and provider redirect policy; non-public destinations are intentionally rejected.",
+        ),
+        "invalid_url": (
+            "low",
+            "Correct the manifest URL before changing provider-specific download rules.",
         ),
         "unknown": (
             "medium",
@@ -207,7 +241,7 @@ def _count_regression_reasons(results: list[dict[str, Any]]) -> dict[str, int]:
 
 def _extract_item_facts(item: dict[str, Any]) -> dict[str, Any]:
     """Derive common booleans and metric values from a single result item."""
-    metrics = item.get("metrics", {})
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
     return {
         "pdf_created": bool(item.get("pdf_created")),
         "md_created": bool(item.get("md_created")),
@@ -220,6 +254,7 @@ def _extract_item_facts(item: dict[str, Any]) -> dict[str, Any]:
             or metrics.get("failure_stage") == "ocr"
         ),
         "crashed": item.get("status") == "crash",
+        "artifact_failed": item.get("status") == "artifact_failed",
         "is_regression": bool(item.get("is_regression")),
         "cache_eligible": metrics.get("ocr_cache_hit") is not None,
         "cache_hit": bool(metrics.get("ocr_cache_hit")),
@@ -231,6 +266,93 @@ def _extract_item_facts(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _case_id(index: int, case: dict[str, Any]) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {"index": index, "name": case["name"], "url": case["url"]},
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"case-{index:03d}-{digest}"
+
+
+def _path_is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _verify_artifact(value: object, case_output_dir: Path, *, suffix: str) -> tuple[bool, Optional[str]]:
+    if not isinstance(value, str) or not value:
+        return False, "missing_path"
+    path = Path(value).expanduser()
+    if path.is_symlink():
+        return False, "symlink_artifact"
+    if not _path_is_inside(path, case_output_dir):
+        return False, "artifact_outside_case_directory"
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False, "artifact_missing_or_empty"
+    except OSError:
+        return False, "artifact_unreadable"
+    if suffix and not path.name.lower().endswith(suffix.lower()):
+        return False, "unexpected_artifact_suffix"
+    if suffix == ".pdf":
+        try:
+            with path.open("rb") as fh:
+                if fh.read(5) != b"%PDF-":
+                    return False, "invalid_pdf_signature"
+            if len(PdfReader(str(path), strict=False).pages) <= 0:
+                return False, "invalid_pdf_page_tree"
+        except Exception:
+            return False, "invalid_pdf_structure"
+    return True, None
+
+
+def _redact_output(text: str) -> str:
+    redacted = re.sub(
+        r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"']+",
+        lambda match: redact_url(match.group(0)),
+        text or "",
+    )
+    return redacted[-MAX_CAPTURE_BYTES:]
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {str(key): _redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    return value
+
+
+_kill_process_tree = kill_process_tree
+
+
+def _read_capture(path: Path) -> str:
+    return read_capture(path, MAX_CAPTURE_BYTES)
+
+
+def _run_benchmark_process(
+    command: list[str],
+    *,
+    case_output_dir: Path,
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[str]:
+    return run_captured_process(
+        command,
+        work_dir=case_output_dir,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=MAX_CAPTURE_BYTES,
+        timeout_label="benchmark subprocess",
+        timeout_error_factory=lambda cmd, seconds: subprocess.TimeoutExpired(cmd, seconds),
+    )
+
+
 def _new_bucket(include_provider_fields: bool = False) -> dict[str, Any]:
     """Create a fresh accumulation bucket for by_input_type or by_provider."""
     bucket: dict[str, Any] = {
@@ -240,6 +362,7 @@ def _new_bucket(include_provider_fields: bool = False) -> dict[str, Any]:
         "download_failure_count": 0,
         "ocr_failure_count": 0,
         "crash_count": 0,
+        "artifact_failure_count": 0,
         "regression_count": 0,
         "regression_reason_counts": {},
         "candidate_count_total": 0,
@@ -265,6 +388,7 @@ def _accumulate_item(bucket: dict[str, Any], facts: dict[str, Any]) -> None:
     bucket["download_failure_count"] += int(facts["download_failed"])
     bucket["ocr_failure_count"] += int(facts["ocr_failed"])
     bucket["crash_count"] += int(facts["crashed"])
+    bucket["artifact_failure_count"] += int(facts["artifact_failed"])
     bucket["regression_count"] += int(facts["is_regression"])
 
     if facts["candidate_count"] is not None:
@@ -333,6 +457,7 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "download_failure_count": sum(1 for f in all_facts if f["download_failed"]),
         "ocr_failure_count": sum(1 for f in all_facts if f["ocr_failed"]),
         "crash_count": sum(1 for f in all_facts if f["crashed"]),
+        "artifact_failure_count": sum(1 for item in results if item.get("status") == "artifact_failed"),
         "regression_count": sum(1 for f in all_facts if f["is_regression"]),
         "regression_reason_counts": regression_reason_counts,
         "ocr_cache_hit_count": ocr_cache_hit_count,
@@ -389,24 +514,55 @@ def load_cases(manifest_path: Path) -> list[dict[str, Any]]:
     if not isinstance(payload, list):
         raise RuntimeError("Benchmark manifest must be a JSON array.")
     cases: list[dict[str, Any]] = []
+    names: set[str] = set()
     for index, item in enumerate(payload, start=1):
         if not isinstance(item, dict):
             raise RuntimeError(f"Case #{index} must be a JSON object.")
-        if "url" not in item:
+        if "url" not in item or not isinstance(item["url"], str):
             raise RuntimeError(f"Case #{index} is missing required field: url")
+        try:
+            normalize_url(item["url"])
+        except ValueError as exc:
+            raise RuntimeError(f"Case #{index} has invalid url: {exc}") from exc
         case = dict(item)
         case.setdefault("name", f"case-{index}")
+        if not isinstance(case["name"], str) or not case["name"].strip() or case["name"] in {".", ".."}:
+            raise RuntimeError(f"Case #{index} has invalid name")
+        if "/" in case["name"] or "\\" in case["name"] or case["name"].startswith("."):
+            raise RuntimeError(f"Case #{index} name must be a display-only value, not a path")
+        if case["name"] in names:
+            raise RuntimeError(f"Duplicate case name: {case['name']}")
+        names.add(case["name"])
         case.setdefault("input_type", "unknown")
         case.setdefault("expected_provider", None)
         case.setdefault("expected_outcome", None)
         case.setdefault("notes", None)
+        if case["expected_provider"] is not None and not isinstance(case["expected_provider"], str):
+            raise RuntimeError(f"Case #{index} expected_provider must be a string or null")
+        if not isinstance(case["input_type"], str):
+            raise RuntimeError(f"Case #{index} input_type must be a string")
+        if case["notes"] is not None and not isinstance(case["notes"], str):
+            raise RuntimeError(f"Case #{index} notes must be a string or null")
+        case["expected_outcome"] = normalize_expected_outcome(case["expected_outcome"])
         cases.append(case)
     return cases
 
 
-def run_case(case: dict[str, Any], output_dir: Path) -> dict[str, Any]:
-    case_output_dir = output_dir / str(case["name"])
-    case_output_dir.mkdir(parents=True, exist_ok=True)
+def run_case(
+    case: dict[str, Any],
+    output_dir: Path,
+    *,
+    case_index: int = 1,
+    timeout_seconds: int = CASE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    case_output_dir = (output_dir / _case_id(case_index, case)).resolve()
+    if not _path_is_inside(case_output_dir, output_dir):
+        raise RuntimeError("Benchmark case output escaped report root")
+    case_output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        case_output_dir.chmod(0o700)
+    except OSError:
+        pass
 
     cmd = [
         sys.executable,
@@ -415,21 +571,55 @@ def run_case(case: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         "--output-dir",
         str(case_output_dir),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = _run_benchmark_process(
+            cmd,
+            case_output_dir=case_output_dir,
+            timeout_seconds=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return evaluate_case_expectations(case, {
+            "name": case["name"],
+            "url": redact_url(case["url"]),
+            "input_type": case.get("input_type", "unknown"),
+            "status": "crash",
+            "pdf_created": False,
+            "md_created": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": f"benchmark case timed out after {timeout_seconds}s",
+            "metrics": {"failure_stage": "benchmark", "failure_reason": "timeout"},
+            "artifact_errors": ["case_timeout"],
+        })
+    except (OSError, RuntimeError) as exc:
+        return evaluate_case_expectations(case, {
+            "name": case["name"],
+            "url": redact_url(case["url"]),
+            "input_type": case.get("input_type", "unknown"),
+            "status": "crash",
+            "pdf_created": False,
+            "md_created": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": _redact_output(str(exc)),
+            "metrics": {"failure_stage": "benchmark", "failure_reason": "process_error"},
+            "artifact_errors": ["benchmark_process_error"],
+        })
     stdout = proc.stdout.strip()
     stderr = proc.stderr.strip()
 
     result: dict[str, Any] = {
         "name": case["name"],
-        "url": case["url"],
+        "url": redact_url(case["url"]),
         "input_type": case.get("input_type", "unknown"),
         "status": "crash",
         "pdf_created": False,
         "md_created": False,
         "exit_code": proc.returncode,
-        "stdout": stdout,
-        "stderr": stderr,
+        "stdout": _redact_output(stdout),
+        "stderr": _redact_output(stderr),
         "metrics": {},
+        "artifact_errors": [],
     }
 
     if stdout:
@@ -438,20 +628,35 @@ def run_case(case: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         except json.JSONDecodeError:
             payload = None
         if isinstance(payload, dict):
-            result["metrics"] = payload.get("metrics") or {}
+            raw_metrics = payload.get("metrics")
+            result["metrics"] = _redact_value(raw_metrics) if isinstance(raw_metrics, dict) else {}
             result["pdf_path"] = payload.get("pdf_path")
             result["md_path"] = payload.get("md_path")
-            result["resolved_pdf_url"] = payload.get("resolved_pdf_url")
-            result["download_error"] = payload.get("download_error")
-            result["ocr_error"] = payload.get("ocr_error")
-            result["pdf_created"] = bool(payload.get("pdf_path"))
-            result["md_created"] = bool(payload.get("md_path"))
+            result["resolved_pdf_url"] = (
+                redact_url(str(payload.get("resolved_pdf_url")))
+                if payload.get("resolved_pdf_url")
+                else None
+            )
+            result["download_error"] = redact_text(str(payload.get("download_error") or "")) or None
+            result["ocr_error"] = redact_text(str(payload.get("ocr_error") or "")) or None
+            pdf_ok, pdf_error = _verify_artifact(payload.get("pdf_path"), case_output_dir, suffix=".pdf")
+            md_ok, md_error = _verify_artifact(payload.get("md_path"), case_output_dir, suffix=".md")
+            result["pdf_created"] = pdf_ok
+            result["md_created"] = md_ok
+            result["artifact_errors"] = [error for error in (pdf_error, md_error) if error]
             if proc.returncode == 0 and payload.get("ok"):
-                result["status"] = "ok"
+                result["status"] = "ok" if pdf_ok and md_ok else "artifact_failed"
             elif result["metrics"].get("failure_stage") == "download":
                 result["status"] = "download_failed"
             elif result["metrics"].get("failure_stage") == "ocr":
                 result["status"] = "ocr_failed"
+        else:
+            result["artifact_errors"] = ["invalid_json_output"]
+
+    if not stdout and proc.returncode != 0:
+        result["stderr"] = _redact_output(stderr) or "benchmark subprocess returned no JSON output"
+    elif not stdout:
+        result["artifact_errors"] = ["missing_json_output"]
 
     return evaluate_case_expectations(case, result)
 
@@ -466,6 +671,7 @@ def write_summary_markdown(summary: dict[str, Any], results: list[dict[str, Any]
         f"- Download failures: {summary['download_failure_count']}",
         f"- OCR failures: {summary['ocr_failure_count']}",
         f"- Crashes: {summary['crash_count']}",
+        f"- Artifact failures: {summary['artifact_failure_count']}",
         f"- Regressions: {summary['regression_count']}",
         f"- Regression reasons: {summary['regression_reason_counts']}",
         f"- OCR cache hits: {summary['ocr_cache_hit_count']}/{summary['ocr_cache_eligible_count']}",
@@ -534,11 +740,48 @@ def main() -> int:
         default=str(SKILL_ROOT / "benchmarks" / "runs"),
         help="Directory to store benchmark outputs.",
     )
+    parser.add_argument(
+        "--case-timeout",
+        type=int,
+        default=CASE_TIMEOUT_SECONDS,
+        help=f"Maximum seconds per case (default: {CASE_TIMEOUT_SECONDS}).",
+    )
+    parser.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help="Return non-zero when provider or outcome expectations regress.",
+    )
+    parser.add_argument(
+        "--fail-on-any-error",
+        action="store_true",
+        help="Return non-zero when any case fails, crashes, or has invalid artifacts.",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Stable run directory suffix; defaults to a timestamp plus random id.",
+    )
     args = parser.parse_args()
 
+    if args.case_timeout <= 0:
+        print("BENCHMARK_ERROR: --case-timeout must be positive", file=sys.stderr)
+        return 2
+
     manifest_path = Path(os.path.expanduser(args.manifest)).resolve()
-    report_dir = Path(os.path.expanduser(args.report_dir)).resolve()
-    report_dir.mkdir(parents=True, exist_ok=True)
+    report_root = Path(os.path.expanduser(args.report_dir)).resolve()
+    run_id = args.run_id or f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
+        print("BENCHMARK_ERROR: --run-id contains unsafe path characters", file=sys.stderr)
+        return 2
+    report_dir = report_root / f"run-{run_id}"
+    if report_dir.is_symlink() or (report_dir.exists() and any(report_dir.iterdir())):
+        print("BENCHMARK_ERROR: run directory already exists; choose a new --run-id", file=sys.stderr)
+        return 2
+    report_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        report_dir.chmod(0o700)
+    except OSError:
+        pass
 
     try:
         cases = load_cases(manifest_path)
@@ -546,23 +789,62 @@ def main() -> int:
         print(f"BENCHMARK_ERROR: {exc}", file=sys.stderr)
         return 2
 
-    results = [run_case(case, report_dir / "outputs") for case in cases]
+    results = [
+        run_case(case, report_dir / "outputs", case_index=index, timeout_seconds=args.case_timeout)
+        for index, case in enumerate(cases, start=1)
+    ]
     summary = summarize_results(results)
 
-    (report_dir / "results.json").write_text(
-        json.dumps(results, ensure_ascii=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (report_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    write_summary_markdown(summary, results, report_dir / "summary.md")
+    git_revision = "unknown"
+    try:
+        git_revision = subprocess.run(
+            ["git", "-C", str(SKILL_ROOT), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+            timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    def _write_json(path: Path, payload: object) -> None:
+        path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
 
+    _write_json(report_dir / "provenance.json", {
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "run_id": run_id,
+        "git_revision": git_revision,
+        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "case_timeout_seconds": args.case_timeout,
+    })
+
+    _write_json(report_dir / "results.json", results)
+    _write_json(report_dir / "summary.json", summary)
+    write_summary_markdown(summary, results, report_dir / "summary.md")
+    try:
+        (report_dir / "summary.md").chmod(0o600)
+    except OSError:
+        pass
+
+    has_error = bool(
+        summary["download_failure_count"]
+        or summary["ocr_failure_count"]
+        or summary["crash_count"]
+        or summary["artifact_failure_count"]
+    )
+    gate_failed = bool((args.fail_on_any_error and has_error) or (args.fail_on_regression and summary["regression_count"]))
     print(
         json.dumps(
             {
-                "ok": True,
+                "ok": not has_error and not bool(summary["regression_count"]),
+                "gate_failed": gate_failed,
                 "manifest": str(manifest_path),
                 "report_dir": str(report_dir),
                 "summary": summary,
@@ -571,7 +853,7 @@ def main() -> int:
             indent=2,
         )
     )
-    return 0
+    return 1 if gate_failed else 0
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # url-pdf-download-ocr
 
-Download a PDF from a user-provided URL, save it locally, and generate a same-name Markdown OCR copy beside it.
+Download a PDF from a user-provided URL, save it locally, and generate a validated Markdown OCR copy beside it.
 
 This repository contains:
 
@@ -28,14 +28,15 @@ This is both a skill repository and a lightweight tool repository.
 
 - Python 3.11 or newer recommended
 - `curl`
+- Python dependencies from `requirements.txt`
 - a PaddleOCR document parsing script compatible with:
   - `--file-path`
   - `--file-type 0`
   - `--output`
 
-By default the downloader looks for PaddleOCR at:
+By default the downloader looks for PaddleOCR at the current user's home directory:
 
-`/Users/wangbo5/.agents/skills/paddleocr-doc-parsing/scripts/vl_caller.py`
+`~/.agents/skills/paddleocr-doc-parsing/scripts/vl_caller.py`
 
 You can override that path in either of these ways:
 
@@ -66,7 +67,11 @@ git clone https://github.com/bobwongagi-code/download-report-pdf.git
 cd download-report-pdf
 ```
 
-No Python package installation is required for the current scripts.
+Install the pinned Python dependency before running the scripts:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
 
 ## Usage
 
@@ -75,6 +80,17 @@ Run the downloader:
 ```bash
 python3 scripts/download_and_ocr.py "PASTE_LINK_HERE"
 ```
+
+HTTPS is required by default. Use `--allow-http` only for a known public HTTP origin.
+
+The default is no-clobber. Existing PDF/Markdown output pairs receive a numeric suffix;
+use `--force` only when replacing regular files is intentional. Markdown is written as
+`report.ocr.md`, so an existing `report.md` is never overwritten.
+
+The downloader rejects userinfo URLs and non-public DNS destinations, requires HTTPS unless
+explicitly overridden, validates every
+redirect and HTML candidate, applies bounded response/deadline budgets, and performs one
+GET per URL hop. Cross-origin candidates embedded in a page are rejected by default.
 
 Run the benchmark runner:
 
@@ -107,12 +123,13 @@ Failed runs still emit structured JSON, including:
 - `failure_reason`
 - `download_error` or `ocr_error`
 
-For large PDFs, OCR now uses a resumable chunked workflow:
+For large PDFs, OCR uses a resumable chunked workflow:
 
 - chunk size is chosen dynamically from page count and file density
 - chunk outputs are persisted under the local Codex cache
 - rerunning the same PDF resumes unfinished chunks instead of restarting from page 1
-- the final `.md` is only produced after all chunks succeed
+- the final `.ocr.md` is only published after every expected page has validated output
+- whitespace-only, missing-page, stale, invalid-schema, and partial results are rejected
 
 ## Benchmarking
 
@@ -132,11 +149,16 @@ Supported normalized expected outcomes:
 - `ocr_failed`
 - `crash`
 
-Benchmark outputs are written under `benchmarks/runs/` by default:
+Benchmark outputs are written under a unique run directory below `benchmarks/runs/` by default:
 
 - `results.json`
 - `summary.json`
 - `summary.md`
+- `provenance.json`
+
+Use `--fail-on-regression` or `--fail-on-any-error` when the benchmark is used as a CI gate.
+The sample manifest contains placeholder URLs and is an error-path smoke manifest, not a
+stable success baseline.
 
 The summary includes:
 
@@ -155,8 +177,12 @@ Large PDFs no longer rely on a single monolithic OCR pass.
 - the wrapper computes page count and file size
 - larger documents are split into chunk PDFs
 - each chunk is retried independently on retryable failures
-- job state is stored under `~/.codex/cache/url-pdf-download-ocr/jobs/<pdf-hash>/`
+- job state is stored under `~/.codex/cache/url-pdf-download-ocr/jobs/<pdf-hash>/<ocr-identity>/`
 - rerunning the command resumes from unfinished chunks
+- OCR cache entries include the PDF hash, script hash/reference, tool/schema versions, page
+  manifest, expiry, and Markdown digest
+- cache data is private, expires after 30 days, is capped at 2 GiB, and can be purged with
+  `--purge-cache`
 
 This keeps user-visible success strict: no final Markdown file is emitted until every chunk finishes successfully.
 
@@ -166,7 +192,7 @@ Run the local checks:
 
 ```bash
 python3 -m unittest discover -s tests
-python3 -m py_compile scripts/download_and_ocr.py scripts/benchmark.py
+python3 -m py_compile scripts/*.py
 ```
 
 Secret scanning is enforced in GitHub Actions with `gitleaks`.

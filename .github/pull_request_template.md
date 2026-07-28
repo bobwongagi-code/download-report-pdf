@@ -5,7 +5,7 @@ Describe what changed and why.
 ## Testing
 
 - [ ] `python3 -m unittest discover -s tests`
-- [ ] `python3 -m py_compile scripts/download_and_ocr.py scripts/benchmark.py`
+- [ ] `python3 -m py_compile scripts/*.py`
 
 ## Sample Impact
 

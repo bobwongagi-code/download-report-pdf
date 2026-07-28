@@ -3,16 +3,16 @@
     "name": "hubspot-report",
     "url": "https://example.com/hubspot-tracking-link",
     "input_type": "hubspot",
-    "expected_provider": "HubSpot",
-    "expected_outcome": "success",
-    "notes": "Replace with a stable real tracking link when maintaining this benchmark set."
+    "expected_provider": null,
+    "expected_outcome": "download_failed",
+    "notes": "Placeholder smoke case; replace with a stable real tracking link before using as a success baseline."
   },
   {
     "name": "direct-pdf",
     "url": "https://example.com/report.pdf",
     "input_type": "direct_pdf",
     "expected_provider": "unknown",
-    "expected_outcome": "success",
-    "notes": "Use a direct PDF URL that should keep working over time."
+    "expected_outcome": "download_failed",
+    "notes": "Placeholder smoke case; replace with a stable direct PDF URL before using as a success baseline."
   }
 ]

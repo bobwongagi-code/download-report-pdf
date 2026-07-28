@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
@@ -8,15 +11,19 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -25,4 +32,4 @@ jobs:
         run: python -m unittest discover -s tests
 
       - name: Run syntax checks
-        run: python -m py_compile scripts/download_and_ocr.py scripts/benchmark.py scripts/http_download.py scripts/providers.py scripts/ocr_runner.py
+        run: python -m py_compile scripts/*.py
